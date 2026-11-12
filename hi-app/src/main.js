@@ -90,6 +90,10 @@ const bytesBySrc = new Map()
 const bufferBySrc = new Map()
 /** @type {Map<string, string>} */
 const blobUrlBySrc = new Map()
+/** @type {Map<string, HTMLAudioElement>} */
+const htmlAudioBySrc = new Map()
+/** @type {Map<string, Promise<void>>} */
+const loadPromiseBySrc = new Map()
 /** @type {Promise<void> | null} */
 let decodeAllPromise = null
 
@@ -146,6 +150,37 @@ function ensureAudioContext() {
   return audioCtx
 }
 
+function primeHtmlAudioUnlock(ctx) {
+  // Tiny silent buffer + start() during the gesture stack makes Safari /
+  // Chromium treat the context as user-activated more reliably than resume() alone.
+  try {
+    const sampleRate = ctx.sampleRate || 44100
+    const silence = ctx.createBuffer(1, 1, sampleRate)
+    const source = ctx.createBufferSource()
+    source.buffer = silence
+    source.connect(ctx.destination)
+    source.start(0)
+  } catch {
+    // ignore priming failures — resume() / HTMLAudio still attempt play
+  }
+}
+
+function ensureHtmlAudio(src) {
+  let clip = htmlAudioBySrc.get(src)
+  if (clip) return clip
+  const url = blobUrlBySrc.get(src) || src
+  clip = new Audio()
+  clip.preload = 'auto'
+  clip.src = url
+  try {
+    clip.load()
+  } catch {
+    // ignore
+  }
+  htmlAudioBySrc.set(src, clip)
+  return clip
+}
+
 async function decodePendingBuffers(ctx) {
   const jobs = []
   for (const [src, bytes] of bytesBySrc) {
@@ -180,6 +215,7 @@ function kickDecode() {
  * Must run synchronously inside a user-gesture stack (pointerdown/click).
  * Create + resume AudioContext here — muted HTMLAudio unlock is not enough
  * in Safari / strict autoplay, and a context created on load stays stuck.
+ * pointerenter / hover alone is NOT a valid autoplay gesture.
  */
 function unlockAudio() {
   const ctx = ensureAudioContext()
@@ -187,6 +223,7 @@ function unlockAudio() {
     audioUnlocked = true
     return Promise.resolve(true)
   }
+  primeHtmlAudioUnlock(ctx)
   kickDecode()
   if (ctx.state === 'running') {
     audioUnlocked = true
@@ -313,9 +350,31 @@ function playViaWebAudio(src, volume) {
 }
 
 function playViaHtmlAudio(src, volume) {
-  const url = blobUrlBySrc.get(src) || src
-  const clip = new Audio(url)
-  clip.preload = 'auto'
+  // Reuse a preloaded element so play() does not race network/readyState on
+  // the first click. Refresh src if the blob URL arrived after first create.
+  const blobUrl = blobUrlBySrc.get(src)
+  let clip = htmlAudioBySrc.get(src)
+  if (!clip) {
+    clip = ensureHtmlAudio(src)
+  } else if (blobUrl && clip.src !== blobUrl && !clip.src.endsWith(blobUrl)) {
+    clip.src = blobUrl
+    try {
+      clip.load()
+    } catch {
+      // ignore
+    }
+  }
+
+  try {
+    clip.pause()
+  } catch {
+    // ignore
+  }
+  try {
+    clip.currentTime = 0
+  } catch {
+    // ignore — may throw if metadata is not ready yet
+  }
   clip.volume = volume
 
   const stopFn = () => {
@@ -333,16 +392,26 @@ function playViaHtmlAudio(src, volume) {
 
   const knownDuration =
     (bufferBySrc.get(src) && bufferBySrc.get(src).duration) ||
+    (Number.isFinite(clip.duration) && clip.duration > 0 ? clip.duration : 0) ||
     phrases.find((p) => p.src === src)?.durationSec ||
-    0
+    (src === BOOP_SRC ? 2.86 : 0)
   const handle = makePlaybackHandle(knownDuration, stopFn)
 
   const attempt = () => clip.play()
   const play = attempt()
   if (play && typeof play.catch === 'function') {
     play.catch(() => {
-      // Still inside a turn after unlock — one immediate retry only.
-      attempt().catch(() => {})
+      // One immediate retry (gesture stack may still be warm after unlock).
+      attempt().catch(() => {
+        // Last resort: new element pointed at blob/path.
+        try {
+          const fallback = new Audio(blobUrlBySrc.get(src) || src)
+          fallback.volume = volume
+          fallback.play().catch(() => {})
+        } catch {
+          // ignore
+        }
+      })
     })
   }
 
@@ -360,12 +429,19 @@ function playViaHtmlAudio(src, volume) {
 function playClip(src, { volume = 1 } = {}) {
   stopActiveAudio()
   // Prefer Web Audio only when the context is already running and the clip is
-  // decoded. Otherwise play a prefetched blob via HTMLAudio so play() stays
-  // inside the user gesture with no network/readyState race.
+  // decoded. Otherwise play a prefetched/preloaded HTMLAudio element so play()
+  // stays inside the user gesture with no network/readyState race.
   const ctx = audioCtx
   const canWeb = Boolean(ctx && ctx.state === 'running' && bufferBySrc.has(src))
-  const handle =
-    (canWeb ? playViaWebAudio(src, volume) : null) || playViaHtmlAudio(src, volume)
+  let handle = canWeb ? playViaWebAudio(src, volume) : null
+  if (!handle) {
+    // Kick a late fetch if prefetch has not landed yet, then play HTMLAudio
+    // from the public path so the gesture is not wasted.
+    if (!bytesBySrc.has(src) && !loadPromiseBySrc.has(src)) {
+      loadClip(src).catch(() => {})
+    }
+    handle = playViaHtmlAudio(src, volume)
+  }
   activeAudio = handle
   return handle
 }
@@ -379,8 +455,25 @@ function playPhrase(index) {
   return playClip(phrase.src)
 }
 
-function playBoop() {
-  unlockAudio()
+function playBoop({ requireGesture = true } = {}) {
+  // Hover alone is not a user-activation gesture in Chromium/Safari — only
+  // play from hover after a prior unlock, otherwise require pointerdown/click.
+  if (requireGesture) {
+    unlockAudio()
+  } else if (!audioUnlocked) {
+    return
+  } else {
+    // Keep the context awake if it was suspended without a new unlock path.
+    const ctx = audioCtx
+    if (ctx && ctx.state === 'suspended') {
+      try {
+        ctx.resume()
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   // Brief interrupt only — does not advance the greeting playlist.
   stopActiveAudio()
   stopSpeaking()
@@ -445,19 +538,40 @@ function softIntro() {
   // Leave phraseIndex at 0 so the first click speaks “Hi!” with audio.
 }
 
-function onNosePointerEnter(event) {
-  event.stopPropagation()
+function triggerBoop(event, { requireGesture = true } = {}) {
+  if (event) event.stopPropagation()
   if (!noseArmed) return
+  // Hover before unlock must not consume the arm — pointerdown still needs it.
+  if (!requireGesture && !audioUnlocked) return
   const now = Date.now()
   if (now - lastBoopAt < BOOP_COOLDOWN_MS) return
   noseArmed = false
   lastBoopAt = now
-  playBoop()
+  playBoop({ requireGesture })
+  // Re-arm shortly after a click/tap so the next intentional boop works
+  // without requiring pointerleave (touch has no reliable hover leave).
+  if (requireGesture) {
+    window.setTimeout(() => {
+      noseArmed = true
+    }, BOOP_COOLDOWN_MS)
+  }
+}
+
+function onNosePointerEnter(event) {
+  // Hover boop only after audio is unlocked by a real gesture.
+  triggerBoop(event, { requireGesture: false })
 }
 
 function onNosePointerLeave() {
   // Re-arm only after the cursor leaves the tip so jitter does not spam.
   noseArmed = true
+}
+
+function onNosePointerDown(event) {
+  // pointerdown IS a user-activation gesture — required for first boop /
+  // touch devices where hover never fires.
+  if (event.pointerType === 'mouse' && event.button !== 0) return
+  triggerBoop(event, { requireGesture: true })
 }
 
 function positionNoseHotspot() {
@@ -516,8 +630,13 @@ again.addEventListener('pointerdown', () => {
 })
 sayHi.addEventListener('click', greet)
 again.addEventListener('click', greet)
+nose.addEventListener('pointerdown', onNosePointerDown)
 nose.addEventListener('pointerenter', onNosePointerEnter)
 nose.addEventListener('pointerleave', onNosePointerLeave)
+nose.addEventListener('click', (event) => {
+  // Keyboard activation / accessibility path.
+  if (event.detail === 0) triggerBoop(event, { requireGesture: true })
+})
 
 window.addEventListener('resize', positionNoseHotspot)
 if (smilePortrait.complete) {
@@ -533,18 +652,47 @@ window.setTimeout(positionNoseHotspot, 1000)
 window.setTimeout(softIntro, 900)
 
 async function loadClip(src) {
-  const res = await fetch(src, { cache: 'force-cache' })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const bytes = await res.arrayBuffer()
-  bytesBySrc.set(src, bytes)
-  blobUrlBySrc.set(src, URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' })))
-  // Decode only after a gesture creates the AudioContext — do not construct
-  // AudioContext during page load (Safari leaves it permanently suspended).
-  if (audioCtx) kickDecode()
+  if (loadPromiseBySrc.has(src)) return loadPromiseBySrc.get(src)
+
+  const job = (async () => {
+    const res = await fetch(src, { cache: 'default' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const bytes = await res.arrayBuffer()
+    bytesBySrc.set(src, bytes)
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }))
+    blobUrlBySrc.set(src, blobUrl)
+
+    // Prefetch into a reusable HTMLAudio element so the first gesture play()
+    // does not wait on readyState.
+    const clip = ensureHtmlAudio(src)
+    if (clip.src !== blobUrl) {
+      clip.src = blobUrl
+      try {
+        clip.load()
+      } catch {
+        // ignore
+      }
+    }
+
+    // Decode only after a gesture creates the AudioContext — do not construct
+    // AudioContext during page load (Safari leaves it permanently suspended).
+    if (audioCtx) kickDecode()
+  })()
+
+  loadPromiseBySrc.set(src, job)
+  try {
+    await job
+  } catch (err) {
+    loadPromiseBySrc.delete(src)
+    throw err
+  }
 }
 
 // Prefetch WAV bytes + blob URLs so the first click is not racing the network.
 ;[...phrases.map((p) => p.src), BOOP_SRC].forEach((src) => {
+  // Start an HTMLAudio preload immediately from the public path, then upgrade
+  // to a blob URL once bytes arrive.
+  ensureHtmlAudio(src)
   loadClip(src).catch(() => {
     const phrase = phrases.find((p) => p.src === src)
     if (phrase) phrase.missing = true
