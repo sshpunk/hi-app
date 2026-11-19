@@ -23,6 +23,13 @@ app.innerHTML = `
           loading="eager"
         />
         <button
+          class="lips-hotspot"
+          type="button"
+          id="lips"
+          aria-label="Touch her lips"
+          title="Lips"
+        ></button>
+        <button
           class="nose-hotspot"
           type="button"
           id="nose"
@@ -62,6 +69,13 @@ const phrases = [
   { text: 'Stop clicking on me!', src: '/phrases/stop.wav', durationSec: 2.14, mood: 'annoyed' },
 ]
 
+function lipsImagePoint() {
+  if (window.matchMedia('(max-width: 640px)').matches) {
+    return { x: 0.52, y: 0.388 }
+  }
+  return { x: 0.5, y: 0.372 }
+}
+
 function noseImagePoint() {
   if (window.matchMedia('(max-width: 640px)').matches) {
     return { x: 0.52, y: 0.348 }
@@ -71,15 +85,18 @@ function noseImagePoint() {
 
 const PORTRAIT_SCALE = 1.04
 const BOOP_COOLDOWN_MS = 700
+const MOAN_DEBOUNCE_MS = 280
 
 const scene = document.querySelector('.scene')
 const smilePortrait = document.querySelector('.portrait--smile')
 const speech = document.querySelector('#speech')
 const sayHi = document.querySelector('#say-hi')
 const again = document.querySelector('#again')
+const lips = document.querySelector('#lips')
 const nose = document.querySelector('#nose')
 
 const BOOP_SRC = '/phrases/boop.wav'
+const MOAN_SRC = '/phrases/moan.wav'
 const AudioCtx = window.AudioContext || window.webkitAudioContext
 
 /** @type {AudioContext | null} */
@@ -104,6 +121,7 @@ let speakTimer
 let activeAudio = null
 let audioUnlocked = false
 let lastBoopAt = 0
+let lastMoanAt = 0
 let noseArmed = true
 
 function setMood(mood) {
@@ -394,7 +412,8 @@ function playViaHtmlAudio(src, volume) {
     (bufferBySrc.get(src) && bufferBySrc.get(src).duration) ||
     (Number.isFinite(clip.duration) && clip.duration > 0 ? clip.duration : 0) ||
     phrases.find((p) => p.src === src)?.durationSec ||
-    (src === BOOP_SRC ? 2.86 : 0)
+    (src === BOOP_SRC ? 2.86 : 0) ||
+    (src === MOAN_SRC ? 0.9 : 0)
   const handle = makePlaybackHandle(knownDuration, stopFn)
 
   const attempt = () => clip.play()
@@ -455,6 +474,30 @@ function playPhrase(index) {
   return playClip(phrase.src)
 }
 
+function showBriefBubble(text, visibleMs) {
+  speech.textContent = text
+  speech.style.setProperty('--bubble-ms', `${visibleMs}ms`)
+  speech.classList.remove('is-visible')
+  void speech.offsetWidth
+  speech.classList.add('is-visible')
+
+  clearTimeout(hideTimer)
+  hideTimer = setTimeout(() => {
+    speech.classList.remove('is-visible')
+  }, visibleMs)
+}
+
+function playMoan() {
+  unlockAudio()
+  // Prefer a clean moan over overlapping speech / boop.
+  stopActiveAudio()
+  stopSpeaking()
+  setMood(null)
+
+  playClip(MOAN_SRC)
+  showBriefBubble('Mmm…', 1400)
+}
+
 function playBoop({ requireGesture = true } = {}) {
   // Hover alone is not a user-activation gesture in Chromium/Safari — only
   // play from hover after a prior unlock, otherwise require pointerdown/click.
@@ -481,18 +524,7 @@ function playBoop({ requireGesture = true } = {}) {
   setMood(null)
 
   playClip(BOOP_SRC)
-
-  const visibleMs = 1200
-  speech.textContent = 'Boop!'
-  speech.style.setProperty('--bubble-ms', `${visibleMs}ms`)
-  speech.classList.remove('is-visible')
-  void speech.offsetWidth
-  speech.classList.add('is-visible')
-
-  clearTimeout(hideTimer)
-  hideTimer = setTimeout(() => {
-    speech.classList.remove('is-visible')
-  }, visibleMs)
+  showBriefBubble('Boop!', 1200)
 }
 
 function showBubble(phrase, visibleMs) {
@@ -574,16 +606,22 @@ function onNosePointerDown(event) {
   triggerBoop(event, { requireGesture: true })
 }
 
-function positionNoseHotspot() {
-  // Skip mid-nod: nose lives inside the talking rig, so last layout coords
-  // stay correct in local space while the parent transform animates.
-  if (scene.classList.contains('is-speaking')) return
+function onLipsActivate(event) {
+  event.preventDefault()
+  event.stopPropagation()
+  const now = Date.now()
+  // pointerdown + click can both fire; keep a single moan per gesture.
+  if (now - lastMoanAt < MOAN_DEBOUNCE_MS) return
+  lastMoanAt = now
+  playMoan()
+}
 
+function mapImagePointToScene(point) {
   const nw = smilePortrait.naturalWidth || 1024
   const nh = smilePortrait.naturalHeight || 1536
   const rect = smilePortrait.getBoundingClientRect()
   const sceneRect = scene.getBoundingClientRect()
-  if (rect.width < 2 || rect.height < 2) return
+  if (rect.width < 2 || rect.height < 2) return null
 
   const layoutW = rect.width / PORTRAIT_SCALE
   const layoutH = rect.height / PORTRAIT_SCALE
@@ -605,7 +643,6 @@ function positionNoseHotspot() {
   const offsetX = (layoutW - dispW) * objectPositionX
   const offsetY = (layoutH - dispH) * objectPositionY
 
-  const point = noseImagePoint()
   let x = layoutLeft - sceneRect.left + offsetX + point.x * dispW
   let y = layoutTop - sceneRect.top + offsetY + point.y * dispH
 
@@ -614,11 +651,31 @@ function positionNoseHotspot() {
   x = cx + (x - cx) * PORTRAIT_SCALE
   y = cy + (y - cy) * PORTRAIT_SCALE
 
-  const noseSize = Math.max(28, Math.min(layoutW, layoutH) * 0.045)
-  nose.style.left = `${x}px`
-  nose.style.top = `${y}px`
-  nose.style.width = `${noseSize}px`
-  nose.style.height = `${noseSize}px`
+  return { x, y, layoutW, layoutH }
+}
+
+function positionFaceHotspots() {
+  // Skip mid-nod: hotspots live inside the talking rig, so last layout coords
+  // stay correct in local space while the parent transform animates.
+  if (scene.classList.contains('is-speaking')) return
+
+  const lipsMapped = mapImagePointToScene(lipsImagePoint())
+  if (lipsMapped) {
+    const lipsSize = Math.max(56, Math.min(lipsMapped.layoutW, lipsMapped.layoutH) * 0.09)
+    lips.style.left = `${lipsMapped.x}px`
+    lips.style.top = `${lipsMapped.y}px`
+    lips.style.width = `${lipsSize * 1.6}px`
+    lips.style.height = `${lipsSize * 0.85}px`
+  }
+
+  const noseMapped = mapImagePointToScene(noseImagePoint())
+  if (noseMapped) {
+    const noseSize = Math.max(28, Math.min(noseMapped.layoutW, noseMapped.layoutH) * 0.045)
+    nose.style.left = `${noseMapped.x}px`
+    nose.style.top = `${noseMapped.y}px`
+    nose.style.width = `${noseSize}px`
+    nose.style.height = `${noseSize}px`
+  }
 }
 
 // Unlock during pointerdown so the gesture still covers the later play().
@@ -630,6 +687,14 @@ again.addEventListener('pointerdown', () => {
 })
 sayHi.addEventListener('click', greet)
 again.addEventListener('click', greet)
+lips.addEventListener('pointerdown', (event) => {
+  if (event.pointerType === 'mouse' && event.button !== 0) return
+  onLipsActivate(event)
+})
+lips.addEventListener('click', (event) => {
+  // Keyboard activation / accessibility path (pointer already handled above).
+  if (event.detail === 0) onLipsActivate(event)
+})
 nose.addEventListener('pointerdown', onNosePointerDown)
 nose.addEventListener('pointerenter', onNosePointerEnter)
 nose.addEventListener('pointerleave', onNosePointerLeave)
@@ -638,15 +703,15 @@ nose.addEventListener('click', (event) => {
   if (event.detail === 0) triggerBoop(event, { requireGesture: true })
 })
 
-window.addEventListener('resize', positionNoseHotspot)
+window.addEventListener('resize', positionFaceHotspots)
 if (smilePortrait.complete) {
-  positionNoseHotspot()
+  positionFaceHotspots()
 } else {
-  smilePortrait.addEventListener('load', positionNoseHotspot, { once: true })
+  smilePortrait.addEventListener('load', positionFaceHotspots, { once: true })
 }
-window.setTimeout(positionNoseHotspot, 50)
-window.setTimeout(positionNoseHotspot, 400)
-window.setTimeout(positionNoseHotspot, 1000)
+window.setTimeout(positionFaceHotspots, 50)
+window.setTimeout(positionFaceHotspots, 400)
+window.setTimeout(positionFaceHotspots, 1000)
 
 // Soft visual intro only — audio starts on the first button gesture.
 window.setTimeout(softIntro, 900)
@@ -689,7 +754,7 @@ async function loadClip(src) {
 }
 
 // Prefetch WAV bytes + blob URLs so the first click is not racing the network.
-;[...phrases.map((p) => p.src), BOOP_SRC].forEach((src) => {
+;[...phrases.map((p) => p.src), BOOP_SRC, MOAN_SRC].forEach((src) => {
   // Start an HTMLAudio preload immediately from the public path, then upgrade
   // to a blob URL once bytes arrive.
   ensureHtmlAudio(src)
